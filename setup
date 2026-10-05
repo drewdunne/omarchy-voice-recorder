@@ -1,0 +1,213 @@
+#!/bin/bash
+# Set up Voice Recorder on this machine.
+#
+# install    add Voice Recording to Capture in the Omarchy menu (SUPER + CTRL + C),
+#            put voice-recorder on PATH and add the bar widget
+# uninstall  stop any recording and remove what install added
+# status     show what is installed (read-only)
+set -euo pipefail
+
+ID="gg.arkship.voice-recorder"
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CTL="$PLUGIN_DIR/bin/voice-recorder"
+MENU_CONFIG="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+LINK="$HOME/.local/bin/voice-recorder"
+BEGIN_MARK=">>> $ID >>>"
+END_MARK="<<< $ID <<<"
+YES=0
+
+usage() {
+  cat <<USAGE
+Usage: setup <install|uninstall|status> [--yes]
+
+  install    Add the Capture menu entries, the command and the bar widget
+  uninstall  Stop any recording and remove what install added
+  status     Show what is installed
+
+--yes skips confirmation prompts.
+USAGE
+}
+
+interactive() {
+  [[ -t 0 ]]
+}
+
+confirm() {
+  [[ $YES == 1 ]] && return 0
+  if ! interactive; then
+    echo "setup: no terminal to confirm in; pass --yes to proceed" >&2
+    exit 1
+  fi
+  read -r -p "$1 [y/N] " reply
+  [[ $reply == [yY]* ]]
+}
+
+backup() {
+  local backup
+  backup="$1.bak.$(date +%s)"
+  cp "$1" "$backup"
+  echo "Backed up $1 to $backup"
+}
+
+# has_block FILE COMMENT-PREFIX
+has_block() {
+  [[ -f $1 ]] && grep -qF -- "$2 $BEGIN_MARK" "$1"
+}
+
+# insert_block FILE ANCHOR-REGEX BLOCK: put BLOCK after the first line
+# matching ANCHOR-REGEX, with a blank line in front of it.
+insert_block() {
+  local tmp
+  tmp=$(mktemp)
+  BLOCK="$3" ANCHOR_RE="$2" awk '
+    { print }
+    !done && $0 ~ ENVIRON["ANCHOR_RE"] { print ""; print ENVIRON["BLOCK"]; done = 1 }
+  ' "$1" >"$tmp"
+  cat "$tmp" >"$1"
+  rm -f "$tmp"
+}
+
+# remove_block FILE COMMENT-PREFIX: drop the block and the blank line
+# insert_block put in front of it.
+remove_block() {
+  local tmp
+  tmp=$(mktemp)
+  BEGIN_LINE="$2 $BEGIN_MARK" END_LINE="$2 $END_MARK" awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    line == ENVIRON["BEGIN_LINE"] { skipping = 1; pending = 0; next }
+    skipping { if (line == ENVIRON["END_LINE"]) skipping = 0; next }
+    $0 == "" { if (pending) print ""; pending = 1; next }
+    { if (pending) print ""; pending = 0; print }
+    END { if (pending) print "" }
+  ' "$1" >"$tmp"
+  cat "$tmp" >"$1"
+  rm -f "$tmp"
+}
+
+# Every entry ends in a comma and the block goes right after the opening
+# brace, so it parses whatever the rest of the file holds (the menu drops a
+# trailing comma before the closing brace). The ids sit under trigger.capture,
+# so the rows land in the Capture menu; the guards swap Voice Recording for
+# Stop Recording while one runs.
+menu_block() {
+  local vr="\$HOME/.config/omarchy/plugins/$ID/bin/voice-recorder"
+  local running="pgrep -f '^omarchy-voicerecorder '"
+  local mic
+  mic=$(printf '\U0000F130')
+  cat <<JSONC
+  // $BEGIN_MARK
+  // Voice Recorder. Remove this block (or run the plugin's \`setup uninstall\`) to go back.
+  "trigger.capture.voicerecord-stop": {"icon":"$mic","label":"Stop Recording","description":"Stop and save the voice recording","when":"$running","action":"$vr stop"},
+  "trigger.capture.voicerecord": {"icon":"$mic","label":"Voice Recording","description":"Record just your microphone","when":"! $running","action":"$vr start"},
+  // $END_MARK
+JSONC
+}
+
+# The shell rescans plugins asynchronously, so a freshly copied plugin can
+# take a moment to become enable-able. Land next to the indicators, where the
+# screen recording light is, when the bar has them.
+enable_widget() {
+  local placement=(--section center)
+  if jq -e '[.bar.layout[][]?.id] | index("omarchy.indicators")' "$HOME/.config/omarchy/shell.json" >/dev/null 2>&1; then
+    placement=(--after omarchy.indicators)
+  fi
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  for _ in {1..20}; do
+    omarchy plugin enable "$ID" "${placement[@]}" >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  echo "Could not enable the bar widget; run: omarchy plugin enable $ID" >&2
+}
+
+check_tools() {
+  local missing=() command
+  for command in ffmpeg pgrep pkill mpv; do
+    command -v "$command" >/dev/null || missing+=("$command")
+  done
+  if ((${#missing[@]})); then
+    echo "setup: missing ${missing[*]}" >&2
+    exit 1
+  fi
+}
+
+install() {
+  check_tools
+
+  echo "This adds Voice Recording to Capture in $MENU_CONFIG,"
+  echo "a link at $LINK, and the bar widget."
+  confirm "Continue?" || exit 1
+
+  if has_block "$MENU_CONFIG" "//"; then
+    echo "The menu already has Voice Recording."
+  else
+    if [[ -f $MENU_CONFIG ]]; then
+      backup "$MENU_CONFIG"
+    else
+      mkdir -p "$(dirname "$MENU_CONFIG")"
+      printf '{\n}\n' >"$MENU_CONFIG"
+    fi
+    grep -q '^[[:space:]]*{[[:space:]]*$' "$MENU_CONFIG" || { echo "setup: no opening { line in $MENU_CONFIG" >&2; exit 1; }
+    insert_block "$MENU_CONFIG" '^[[:space:]]*[{][[:space:]]*$' "$(menu_block)"
+  fi
+
+  mkdir -p "$(dirname "$LINK")"
+  if [[ -e $LINK && ! -L $LINK ]]; then
+    echo "Left $LINK alone: it is a file, not a link." >&2
+  else
+    ln -sfn "$CTL" "$LINK"
+  fi
+
+  enable_widget
+
+  echo
+  echo "Voice Recorder is installed. Press SUPER + CTRL + C and pick Voice Recording,"
+  echo "or click the mic in the bar."
+}
+
+uninstall() {
+  confirm "Stop any recording and remove Voice Recorder's menu entries, command and bar widget?" || exit 1
+
+  if "$CTL" running; then "$CTL" stop >/dev/null || true; fi
+
+  if has_block "$MENU_CONFIG" "//"; then
+    backup "$MENU_CONFIG"
+    remove_block "$MENU_CONFIG" "//"
+  fi
+
+  if [[ -L $LINK && $(readlink "$LINK") == "$CTL" ]]; then
+    rm -f "$LINK"
+  fi
+
+  omarchy plugin disable "$ID" >/dev/null 2>&1 || true
+  echo "Remove the plugin with: omarchy plugin remove $ID"
+}
+
+status() {
+  local yes="installed" no="not installed"
+  echo "Menu entries:  $(has_block "$MENU_CONFIG" "//" && echo "$yes" || echo "$no")"
+  echo "Command:       $([[ -L $LINK && $(readlink "$LINK") == "$CTL" ]] && echo "$yes ($LINK)" || echo "$no")"
+  echo "Recording:     $("$CTL" running && echo "yes" || echo "no")"
+}
+
+command="${1:-}"
+[[ $# -gt 0 ]] && shift
+for arg in "$@"; do
+  case "$arg" in
+  --yes | -y) YES=1 ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+  esac
+done
+
+case "$command" in
+install) install ;;
+uninstall) uninstall ;;
+status) status ;;
+-h | --help | help) usage ;;
+*)
+  usage >&2
+  exit 2
+  ;;
+esac

@@ -1,0 +1,147 @@
+#!/bin/bash
+# Record your microphone, and only your microphone: no screen recording to
+# throw away afterwards.
+#
+# toggle (default)  start a recording, or stop and save the one running
+# start             start recording the default input
+# stop              stop and save the recording
+# running           exit 0 while a recording runs
+# open              open the recordings folder
+#
+# Recordings are AAC .m4a files in $OMARCHY_VOICERECORD_DIR, or else your
+# Music folder (XDG_MUSIC_DIR, ~/Music).
+set -uo pipefail
+
+ID=gg.arkship.voice-recorder
+SELF="$HOME/.config/omarchy/plugins/$ID/bin/voice-recorder"
+
+[[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+OUTPUT_DIR="${OMARCHY_VOICERECORD_DIR:-${XDG_MUSIC_DIR:-$HOME/Music}}"
+
+# The stop path reads this back and writes, moves and deletes at the path it
+# names, so it lives in the private runtime dir rather than world-writable /tmp.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/voice-recorder}"
+RECORDING_FILE="$RUNTIME_DIR/omarchy-voicerecord-filename"
+
+# ffmpeg runs under this name so the bar widget, the menu and this script can
+# find the recorder without matching any other ffmpeg that happens to run.
+RECORDER_NAME="omarchy-voicerecorder"
+
+refresh_bar() {
+  omarchy-shell -q "$ID" refresh >/dev/null 2>&1 || true
+}
+
+running() {
+  pgrep -f "^$RECORDER_NAME " >/dev/null
+}
+
+start() {
+  if running; then
+    echo "voice-recorder: already recording" >&2
+    return 1
+  fi
+
+  if ! mkdir -p "$OUTPUT_DIR"; then
+    omarchy-notification-send -u critical -t 3000 "Voice recording folder can't be created: $OUTPUT_DIR"
+    return 1
+  fi
+
+  mkdir -p "$RUNTIME_DIR" || return 1
+  # The state-dir fallback may sit outside a private home; keep it private.
+  if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
+    chmod 700 "$RUNTIME_DIR" || return 1
+  fi
+
+  local filename="$OUTPUT_DIR/voicerecording-$(date +'%Y-%m-%d_%H-%M-%S').m4a"
+
+  # gpu-screen-recorder always needs a video source, so record through ffmpeg's
+  # PulseAudio input, which PipeWire serves.
+  (exec -a "$RECORDER_NAME" ffmpeg -hide_banner -loglevel error -nostdin -f pulse -i default -c:a aac "$filename") &
+  local pid=$!
+
+  while kill -0 $pid 2>/dev/null && [[ ! -f $filename ]]; do
+    sleep 0.2
+  done
+
+  if kill -0 $pid 2>/dev/null; then
+    echo "$filename" >"$RECORDING_FILE"
+    refresh_bar
+    omarchy-notification-send -g 󰍰 "Voice recording started" "Click the mic in the bar to stop (or click this)" \
+      --exec "$SELF" stop
+  else
+    omarchy-notification-send -u critical -t 3000 "Voice recording failed to start" "Could not record from the default microphone"
+    return 1
+  fi
+}
+
+stop() {
+  if ! running; then
+    echo "voice-recorder: not recording" >&2
+    return 1
+  fi
+
+  pkill -SIGINT -f "^$RECORDER_NAME " # SIGINT lets ffmpeg finish writing the file
+
+  # Wait a maximum of 5 seconds to finish before hard killing
+  local count=0
+  while running && ((count < 50)); do
+    sleep 0.1
+    count=$((count + 1))
+  done
+
+  if running; then
+    pkill -9 -f "^$RECORDER_NAME "
+    omarchy-notification-send -u critical -t 5000 "Voice recording error" "Recording process had to be force-killed. Audio may be corrupted."
+  else
+    finalize
+    local filename
+    filename=$(cat "$RECORDING_FILE" 2>/dev/null)
+    echo "$filename"
+
+    omarchy-notification-send -g 󰍰 "Voice recording saved" "Open with Super + Alt + , (or click this)" -t 10000 \
+      --exec mpv --player-operation-mode=pseudo-gui -- "$filename"
+  fi
+
+  refresh_bar
+  rm -f "$RECORDING_FILE"
+}
+
+finalize() {
+  local latest
+  latest=$(cat "$RECORDING_FILE" 2>/dev/null)
+  [[ -f $latest ]] || return
+
+  # The same cleanup Omarchy gives screen recordings: hard-mute the first 400ms
+  # to drop the PipeWire capture-open pop, fade in over 50ms to avoid a click,
+  # then normalize to -14 LUFS. loudnorm resamples to 192kHz internally, so set
+  # the rate back.
+  local processed="${latest%.m4a}-processed.m4a"
+  if ffmpeg -y -i "$latest" \
+    -af "volume=enable='lt(t,0.4)':volume=0,afade=t=in:st=0.4:d=0.05,loudnorm=I=-14:TP=-1.5:LRA=11" \
+    -ar 48000 -c:a aac "$processed" -loglevel quiet 2>/dev/null; then
+    mv "$processed" "$latest"
+  else
+    rm -f "$processed"
+  fi
+}
+
+case "${1:-toggle}" in
+toggle)
+  if running; then
+    stop
+  else
+    start
+  fi
+  ;;
+start) start ;;
+stop) stop ;;
+running) running ;;
+open)
+  mkdir -p "$OUTPUT_DIR" && xdg-open "$OUTPUT_DIR" >/dev/null 2>&1 &
+  ;;
+-h | --help | help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+*)
+  echo "Usage: voice-recorder [toggle|start|stop|running|open]" >&2
+  exit 2
+  ;;
+esac

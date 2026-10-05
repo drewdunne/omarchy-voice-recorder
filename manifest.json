@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "gg.arkship.voice-recorder",
+  "name": "Voice Recorder",
+  "version": "0.1.0",
+  "author": "Andrew Dunne",
+  "description": "Record just your microphone from the Capture menu or the bar, no screen recording needed",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "VoiceRecorder.qml"
+  },
+  "barWidget": {
+    "displayName": "Voice Recorder",
+    "description": "Lights up while your mic records; click to start or stop",
+    "category": "Audio",
+    "defaultSection": "center",
+    "allowMultiple": false
+  }
+}
