@@ -9,7 +9,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
-trap 'pkill -f "$WORK/bin/ffmpeg" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+# pkill is stubbed below, so clean up with the real one
+REAL_PKILL=$(command -v pkill)
+trap '"$REAL_PKILL" -f "$WORK/bin/ffmpeg" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 export HOME="$WORK/home"
 export XDG_CONFIG_HOME="$HOME/.config"
@@ -27,21 +29,36 @@ STUB
   chmod +x "$WORK/bin/$command"
 done
 
-# Nothing is recording, so start rather than refuse.
-cat >"$WORK/bin/pgrep" <<'STUB'
+# The recorder counts as running while its marker file exists, and SIGINT
+# stops it.
+cat >"$WORK/bin/pgrep" <<STUB
 #!/bin/bash
-exit 1
+[[ -e "$WORK/recording" ]]
+STUB
+cat >"$WORK/bin/pkill" <<STUB
+#!/bin/bash
+echo "pkill \$*" >>"$WORK/calls"
+rm -f "$WORK/recording"
 STUB
 
-# Stands in for the recorder: create the output file (the last argument) the
-# way ffmpeg does once capture starts, then keep running.
+# Stands in for both ffmpeg runs. The recorder creates its output file (the
+# last argument) the way ffmpeg does once capture starts, then keeps running;
+# the audio cleanup (-af) writes its -processed output.
 cat >"$WORK/bin/ffmpeg" <<STUB
 #!/bin/bash
-printf '%s\n' "\$@" >"$WORK/ffmpeg-args"
-: >"\${@: -1}"
-sleep 5
+if [[ " \$* " == *" -af "* ]]; then
+  for arg in "\$@"; do
+    [[ \$arg == *-processed.m4a ]] && echo processed >"\$arg"
+  done
+  exit 0
+else
+  printf '%s\n' "\$@" >"$WORK/ffmpeg-args"
+  : >"\${@: -1}"
+  : >"$WORK/recording"
+  sleep 30
+fi
 STUB
-chmod +x "$WORK/bin/pgrep" "$WORK/bin/ffmpeg"
+chmod +x "$WORK/bin/pgrep" "$WORK/bin/pkill" "$WORK/bin/ffmpeg"
 export PATH="$WORK/bin:$PATH"
 
 MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
@@ -84,6 +101,10 @@ state_names_recording() {
   [[ $(<"$XDG_RUNTIME_DIR/omarchy-voicerecord-filename") == "$HOME/recordings"/voicerecording-*.m4a ]]
 }
 
+saved_is_processed() {
+  [[ -n $SAVED && $SAVED == "$RECORDING" && $(<"$SAVED") == processed ]]
+}
+
 # ---------------------------------------------------------------- install
 bash "$PLUGIN/setup" install --yes >/dev/null
 check "menu block parses" menu_parses
@@ -100,11 +121,23 @@ OMARCHY_VOICERECORD_DIR="$HOME/recordings" "$PLUGIN/bin/voice-recorder" start >/
 check "start creates the recordings folder" test -d "$HOME/recordings"
 check "start records the default input" grep -qx default "$WORK/ffmpeg-args"
 check "start records nothing but audio" grep -qx pulse "$WORK/ffmpeg-args"
+check "start writes fragments that survive a hard kill" grep -qx -- -frag_duration "$WORK/ffmpeg-args"
 check "state file names the recording" state_names_recording
 check "start refreshes the bar widget" grep -q "omarchy-shell -q gg.arkship.voice-recorder refresh" "$WORK/calls"
 check "start says it is recording" grep -q "Voice recording started" "$WORK/calls"
+RECORDING=$(<"$XDG_RUNTIME_DIR/omarchy-voicerecord-filename")
+: >"$WORK/calls"
+SAVED=$(OMARCHY_VOICERECORD_DIR="$HOME/recordings" "$PLUGIN/bin/voice-recorder" stop 2>/dev/null) || true
+check "stop sends the recorder SIGINT" grep -q "pkill -SIGINT -f ^omarchy-voicerecorder" "$WORK/calls"
+check "stop saves the cleaned-up recording" saved_is_processed
+check "stop removes the state file" test ! -e "$XDG_RUNTIME_DIR/omarchy-voicerecord-filename"
+check "stop says it saved" grep -q "Voice recording saved" "$WORK/calls"
+check "stop refreshes the bar widget" grep -q "omarchy-shell -q gg.arkship.voice-recorder refresh" "$WORK/calls"
+"$REAL_PKILL" -f "$WORK/bin/ffmpeg" 2>/dev/null || true
+
+: >"$WORK/calls"
 check "stop with nothing recording fails" bash -c '! "$0" stop' "$PLUGIN/bin/voice-recorder"
-pkill -f "$WORK/bin/ffmpeg" 2>/dev/null || true
+check "stop with nothing recording clears a stale bar" grep -q "omarchy-shell -q gg.arkship.voice-recorder refresh" "$WORK/calls"
 
 # ---------------------------------------------------------------- uninstall
 bash "$PLUGIN/setup" uninstall --yes >/dev/null

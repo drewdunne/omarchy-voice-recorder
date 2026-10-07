@@ -35,6 +35,23 @@ running() {
   pgrep -f "^$RECORDER_NAME " >/dev/null
 }
 
+prepare_runtime_dir() {
+  mkdir -p "$RUNTIME_DIR" || return 1
+  # The state-dir fallback may sit outside a private home; keep it private.
+  if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
+    chmod 700 "$RUNTIME_DIR" || return 1
+  fi
+}
+
+# The recorder has exited before the audio cleanup runs, so without this a
+# recording started while the last one is still being saved would overlap its
+# stop. Hold the lock through the whole start or stop instead.
+lock() {
+  prepare_runtime_dir || exit 1
+  exec 9>"$RUNTIME_DIR/voice-recorder.lock"
+  flock 9
+}
+
 start() {
   if running; then
     echo "voice-recorder: already recording" >&2
@@ -46,17 +63,17 @@ start() {
     return 1
   fi
 
-  mkdir -p "$RUNTIME_DIR" || return 1
-  # The state-dir fallback may sit outside a private home; keep it private.
-  if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
-    chmod 700 "$RUNTIME_DIR" || return 1
-  fi
-
   local filename="$OUTPUT_DIR/voicerecording-$(date +'%Y-%m-%d_%H-%M-%S').m4a"
 
   # gpu-screen-recorder always needs a video source, so record through ffmpeg's
   # PulseAudio input, which PipeWire serves.
-  (exec -a "$RECORDER_NAME" ffmpeg -hide_banner -loglevel error -nostdin -f pulse -i default -c:a aac "$filename") &
+  # An .m4a is unreadable until ffmpeg writes its index on a clean exit, so
+  # write one-second fragments and flush each one: a recorder that has to be
+  # force-killed still leaves everything but the last second playable. The
+  # cleanup on stop writes a regular .m4a. fd 9 is the lock, which must not
+  # outlive this script.
+  (exec -a "$RECORDER_NAME" ffmpeg -hide_banner -loglevel error -nostdin -f pulse -i default -c:a aac \
+    -movflags +empty_moov+default_base_moof -frag_duration 1000000 -flush_packets 1 "$filename" 9>&-) &
   local pid=$!
 
   while kill -0 $pid 2>/dev/null && [[ ! -f $filename ]]; do
@@ -76,9 +93,14 @@ start() {
 
 stop() {
   if ! running; then
+    # A bar still showing a recording is stale
+    refresh_bar
     echo "voice-recorder: not recording" >&2
     return 1
   fi
+
+  local filename
+  filename=$(cat "$RECORDING_FILE" 2>/dev/null)
 
   pkill -SIGINT -f "^$RECORDER_NAME " # SIGINT lets ffmpeg finish writing the file
 
@@ -89,26 +111,30 @@ stop() {
     count=$((count + 1))
   done
 
+  local force_killed="false"
   if running; then
     pkill -9 -f "^$RECORDER_NAME "
-    omarchy-notification-send -u critical -t 5000 "Voice recording error" "Recording process had to be force-killed. Audio may be corrupted."
-  else
-    finalize
-    local filename
-    filename=$(cat "$RECORDING_FILE" 2>/dev/null)
-    echo "$filename"
+    force_killed="true"
+  fi
 
+  # The recorder is gone, so the bar can stop showing it before the cleanup runs
+  rm -f "$RECORDING_FILE"
+  refresh_bar
+
+  finalize "$filename"
+  echo "$filename"
+
+  if [[ $force_killed == "true" ]]; then
+    omarchy-notification-send -u critical -t 5000 "Voice recording force-stopped" "The recorder didn't stop in time, so the last second may be missing. Click to open." \
+      --exec mpv --player-operation-mode=pseudo-gui -- "$filename"
+  else
     omarchy-notification-send -g 󰍰 "Voice recording saved" "Open with Super + Alt + , (or click this)" -t 10000 \
       --exec mpv --player-operation-mode=pseudo-gui -- "$filename"
   fi
-
-  refresh_bar
-  rm -f "$RECORDING_FILE"
 }
 
 finalize() {
-  local latest
-  latest=$(cat "$RECORDING_FILE" 2>/dev/null)
+  local latest=$1
   [[ -f $latest ]] || return
 
   # The same cleanup Omarchy gives screen recordings: hard-mute the first 400ms
@@ -127,14 +153,21 @@ finalize() {
 
 case "${1:-toggle}" in
 toggle)
+  lock
   if running; then
     stop
   else
     start
   fi
   ;;
-start) start ;;
-stop) stop ;;
+start)
+  lock
+  start
+  ;;
+stop)
+  lock
+  stop
+  ;;
 running) running ;;
 open)
   mkdir -p "$OUTPUT_DIR" && xdg-open "$OUTPUT_DIR" >/dev/null 2>&1 &
