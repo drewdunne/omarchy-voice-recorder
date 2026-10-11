@@ -25,14 +25,48 @@ RECORDING_FILE="$RUNTIME_DIR/omarchy-voicerecord-filename"
 
 # ffmpeg runs under this name so the bar widget, the menu and this script can
 # find the recorder without matching any other ffmpeg that happens to run.
+# Every lookup is limited to this user's processes.
 RECORDER_NAME="omarchy-voicerecorder"
+
+# An .m4a is unreadable until ffmpeg writes its index on a clean exit, so write
+# one-second fragments and flush each one: a recorder that has to be
+# force-killed still leaves everything but the last second playable. The
+# cleanup on stop writes a regular .m4a.
+FRAGMENT_ARGS=(-movflags +empty_moov+default_base_moof -frag_duration 1000000 -flush_packets 1)
+
+# Tenths of a second ffmpeg gets to open the microphone and create the file
+STARTUP_TIMEOUT=100
 
 refresh_bar() {
   omarchy-shell -q "$ID" refresh >/dev/null 2>&1 || true
 }
 
 running() {
-  pgrep -f "^$RECORDER_NAME " >/dev/null
+  pgrep -u "$UID" -f "^$RECORDER_NAME " >/dev/null
+}
+
+# signal_recorder SIGNAL
+signal_recorder() {
+  pkill "$1" -u "$UID" -f "^$RECORDER_NAME "
+}
+
+# end_process PID: TERM, then KILL if it hasn't gone within a second, then reap
+end_process() {
+  kill "$1" 2>/dev/null
+  local count=0
+  while kill -0 "$1" 2>/dev/null && ((count < 10)); do
+    sleep 0.1
+    count=$((count + 1))
+  done
+  kill -9 "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
+
+# has_audio FILE: the file decodes to at least one audio packet
+has_audio() {
+  local packets
+  packets=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null | head -n 1)
+  [[ $packets =~ ^[0-9]+$ ]] && ((packets > 0))
 }
 
 prepare_runtime_dir() {
@@ -48,8 +82,8 @@ prepare_runtime_dir() {
 # stop. Hold the lock through the whole start or stop instead.
 lock() {
   prepare_runtime_dir || exit 1
-  exec 9>"$RUNTIME_DIR/voice-recorder.lock"
-  flock 9
+  exec 9>"$RUNTIME_DIR/voice-recorder.lock" || exit 1
+  flock 9 || exit 1
 }
 
 start() {
@@ -63,29 +97,38 @@ start() {
     return 1
   fi
 
-  local filename="$OUTPUT_DIR/voicerecording-$(date +'%Y-%m-%d_%H-%M-%S').m4a"
-
-  # gpu-screen-recorder always needs a video source, so record through ffmpeg's
-  # PulseAudio input, which PipeWire serves.
-  # An .m4a is unreadable until ffmpeg writes its index on a clean exit, so
-  # write one-second fragments and flush each one: a recorder that has to be
-  # force-killed still leaves everything but the last second playable. The
-  # cleanup on stop writes a regular .m4a. fd 9 is the lock, which must not
-  # outlive this script.
-  (exec -a "$RECORDER_NAME" ffmpeg -hide_banner -loglevel error -nostdin -f pulse -i default -c:a aac \
-    -movflags +empty_moov+default_base_moof -frag_duration 1000000 -flush_packets 1 "$filename" 9>&-) &
-  local pid=$!
-
-  while kill -0 $pid 2>/dev/null && [[ ! -f $filename ]]; do
-    sleep 0.2
+  # A recording stopped within a second of starting leaves this second's name
+  # taken, so never reuse a name; -n makes ffmpeg refuse to overwrite one too.
+  local base="$OUTPUT_DIR/voicerecording-$(date +'%Y-%m-%d_%H-%M-%S')"
+  local filename="$base.m4a" n=1
+  while [[ -e $filename ]]; do
+    n=$((n + 1))
+    filename="$base-$n.m4a"
   done
 
-  if kill -0 $pid 2>/dev/null; then
-    echo "$filename" >"$RECORDING_FILE"
+  # gpu-screen-recorder always needs a video source, so record through ffmpeg's
+  # PulseAudio input, which PipeWire serves. fd 9 is the lock, which must not
+  # outlive this script.
+  (exec -a "$RECORDER_NAME" ffmpeg -n -hide_banner -loglevel error -nostdin -f pulse -i default -c:a aac \
+    "${FRAGMENT_ARGS[@]}" "$filename" 9>&-) &
+  local pid=$!
+
+  # Bounded, since this holds the lock: an ffmpeg stuck connecting to the audio
+  # server would otherwise leave nothing able to stop it.
+  local waited=0
+  while kill -0 $pid 2>/dev/null && [[ ! -f $filename ]] && ((waited < STARTUP_TIMEOUT)); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 $pid 2>/dev/null && [[ -f $filename ]] && echo "$filename" >"$RECORDING_FILE"; then
     refresh_bar
     omarchy-notification-send -g 󰍰 "Voice recording started" "Click the mic in the bar to stop (or click this)" \
       --exec "$SELF" stop
   else
+    # Without the state file the stop couldn't find the recording, so don't
+    # leave a recorder running either
+    end_process "$pid"
     omarchy-notification-send -u critical -t 3000 "Voice recording failed to start" "Could not record from the default microphone"
     return 1
   fi
@@ -102,7 +145,7 @@ stop() {
   local filename
   filename=$(cat "$RECORDING_FILE" 2>/dev/null)
 
-  pkill -SIGINT -f "^$RECORDER_NAME " # SIGINT lets ffmpeg finish writing the file
+  signal_recorder -SIGINT # SIGINT lets ffmpeg finish writing the file
 
   # Wait a maximum of 5 seconds to finish before hard killing
   local count=0
@@ -113,7 +156,7 @@ stop() {
 
   local force_killed="false"
   if running; then
-    pkill -9 -f "^$RECORDER_NAME "
+    signal_recorder -9
     force_killed="true"
   fi
 
@@ -121,8 +164,18 @@ stop() {
   rm -f "$RECORDING_FILE"
   refresh_bar
 
-  finalize "$filename"
+  if [[ ! -f $filename ]]; then
+    omarchy-notification-send -u critical -t 5000 "Voice recording stopped" "Its file couldn't be found, so nothing was saved"
+    return 1
+  fi
+
   echo "$filename"
+
+  if ! finalize "$filename"; then
+    omarchy-notification-send -u critical -t 5000 "Voice recording may be damaged" "It couldn't be cleaned up, so it was kept exactly as recorded. Click to try opening it." \
+      --exec mpv --player-operation-mode=pseudo-gui -- "$filename"
+    return 1
+  fi
 
   if [[ $force_killed == "true" ]]; then
     omarchy-notification-send -u critical -t 5000 "Voice recording force-stopped" "The recorder didn't stop in time, so the last second may be missing. Click to open." \
@@ -133,21 +186,38 @@ stop() {
   fi
 }
 
+# Replaces the recording with its cleaned-up audio, or fails and leaves it
+# exactly as recorded when nothing playable comes out
 finalize() {
-  local latest=$1
-  [[ -f $latest ]] || return
+  # Same cleanup as screen recordings: hard-mute the first 400ms to drop the
+  # PipeWire capture-open pop, fade in over 50ms to avoid a click, then normalize
+  # to -14 LUFS. loudnorm resamples to 192kHz internally, so set the rate back.
+  # loudnorm fails on clips too short or too quiet to measure (under about 0.4s,
+  # or silent and under 3s), so keep those as recorded, rewritten from fragments
+  # into a regular .m4a.
+  replace_with_ffmpeg_output "$1" -af "volume=enable='lt(t,0.4)':volume=0,afade=t=in:st=0.4:d=0.05,loudnorm=I=-14:TP=-1.5:LRA=11" \
+    -ar 48000 -c:a aac ||
+    replace_with_ffmpeg_output "$1" -c:a copy
+}
 
-  # The same cleanup Omarchy gives screen recordings: hard-mute the first 400ms
-  # to drop the PipeWire capture-open pop, fade in over 50ms to avoid a click,
-  # then normalize to -14 LUFS. loudnorm resamples to 192kHz internally, so set
-  # the rate back.
-  local processed="${latest%.m4a}-processed.m4a"
-  if ffmpeg -y -i "$latest" \
-    -af "volume=enable='lt(t,0.4)':volume=0,afade=t=in:st=0.4:d=0.05,loudnorm=I=-14:TP=-1.5:LRA=11" \
-    -ar 48000 -c:a aac "$processed" -loglevel quiet 2>/dev/null; then
-    mv "$processed" "$latest"
+# Replaces FILE with what ffmpeg makes of it given ARGS, if that decodes to audio
+replace_with_ffmpeg_output() {
+  local latest=$1
+  shift
+
+  # A fresh file from mktemp, never a name that something else could already
+  # have put there for ffmpeg -y to write through
+  local processed
+  processed=$(mktemp --tmpdir="$(dirname -- "$latest")" --suffix=.m4a ".$(basename -- "${latest%.m4a}").XXXXXX") || return 1
+
+  # -nostdin, or a q typed in the terminal that ran the stop would end ffmpeg
+  # early and leave a cut-short recording in place of the original
+  if ffmpeg -nostdin -loglevel quiet -y -i "$latest" "$@" "$processed" 2>/dev/null && has_audio "$processed"; then
+    chmod --reference="$latest" "$processed"
+    mv -f "$processed" "$latest"
   else
     rm -f "$processed"
+    return 1
   fi
 }
 

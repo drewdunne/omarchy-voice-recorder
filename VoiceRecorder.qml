@@ -14,9 +14,16 @@ BarWidget {
     + "/.config/omarchy/plugins/gg.arkship.voice-recorder/bin/voice-recorder"
 
   property bool recording: false
+  // A refresh asked for while a check is still running, such as the one a
+  // starting recording sends, must not be dropped: that check may predate it
+  property bool refreshPending: false
 
   function refresh() {
-    if (!stateProc.running) stateProc.running = true
+    if (stateProc.running) {
+      root.refreshPending = true
+      return
+    }
+    stateProc.running = true
   }
 
   function run(args) {
@@ -36,12 +43,17 @@ BarWidget {
     }
   }
 
-  // The recorder runs as ffmpeg renamed to omarchy-voicerecorder.
+  // Only this user's recorder, which runs as ffmpeg renamed to
+  // omarchy-voicerecorder
   Process {
     id: stateProc
-    command: ["pgrep", "--quiet", "-f", "^omarchy-voicerecorder "]
+    command: ["bash", "-c", "pgrep --quiet -u \"$UID\" -f '^omarchy-voicerecorder '"]
     onExited: function(exitCode) {
       root.recording = exitCode === 0
+      if (root.refreshPending) {
+        root.refreshPending = false
+        Qt.callLater(root.refresh)
+      }
     }
   }
 

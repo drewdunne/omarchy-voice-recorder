@@ -91,7 +91,7 @@ remove_block() {
 # Stop Recording while one runs.
 menu_block() {
   local vr="\$HOME/.config/omarchy/plugins/$ID/bin/voice-recorder"
-  local running="pgrep -f '^omarchy-voicerecorder '"
+  local running="pgrep -u \$UID -f '^omarchy-voicerecorder '"
   local mic
   mic=$(printf '\U0000F130')
   cat <<JSONC
