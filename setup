@@ -54,6 +54,16 @@ has_block() {
   [[ -f $1 ]] && grep -qF -- "$2 $BEGIN_MARK" "$1"
 }
 
+# current_block FILE COMMENT-PREFIX: the block as it stands, markers included
+current_block() {
+  BEGIN_LINE="$2 $BEGIN_MARK" END_LINE="$2 $END_MARK" awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    line == ENVIRON["BEGIN_LINE"] { printing = 1 }
+    printing { print }
+    line == ENVIRON["END_LINE"] { printing = 0 }
+  ' "$1"
+}
+
 # insert_block FILE ANCHOR-REGEX BLOCK: put BLOCK after the first line
 # matching ANCHOR-REGEX, with a blank line in front of it.
 insert_block() {
@@ -137,8 +147,14 @@ install() {
   echo "a link at $LINK, and the bar widget."
   confirm "Continue?" || exit 1
 
-  if has_block "$MENU_CONFIG" "//"; then
+  # An older install's block is replaced, so a reinstall picks up its fixes
+  if has_block "$MENU_CONFIG" "//" && [[ $(current_block "$MENU_CONFIG" "//") == "$(menu_block)" ]]; then
     echo "The menu already has Voice Recording."
+  elif has_block "$MENU_CONFIG" "//"; then
+    backup "$MENU_CONFIG"
+    remove_block "$MENU_CONFIG" "//"
+    insert_block "$MENU_CONFIG" '^[[:space:]]*[{][[:space:]]*$' "$(menu_block)"
+    echo "Updated Voice Recording in the menu."
   else
     if [[ -f $MENU_CONFIG ]]; then
       backup "$MENU_CONFIG"

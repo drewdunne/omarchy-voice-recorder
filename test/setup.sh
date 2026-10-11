@@ -73,9 +73,16 @@ STUB
 # file (the last argument) once it "has the microphone", unless it stalls, and
 # runs until signalled; a hanging one ignores the stop. The cleanup can wait at
 # a gate, can produce nothing, or can fail its loudness pass (-af) the way
-# loudnorm does on a clip too short or quiet to measure.
+# loudnorm does on a clip too short or quiet to measure. A stalling capture
+# ignores TERM too. The decode check (-f null) passes what the cleanup wrote.
 cat >"$WORK/bin/ffmpeg" <<STUB
 #!/bin/bash
+if [[ " \$* " == *" -f null "* ]]; then
+  while ((\$#)) && [[ \$1 != -i ]]; do shift; done
+  [[ -s \$2 && \$(<"\$2") == @(processed|remuxed) ]]
+  exit
+fi
+
 if [[ " \$* " != *" pulse "* ]]; then
   printf '%s\n' "\$@" >"$WORK/finalize-args"
   echo finalize-begin >>"$WORK/order"
@@ -101,7 +108,7 @@ fi
 printf '%s\n' "\$@" >"$WORK/ffmpeg-args"
 echo \$\$ >"$WORK/recorder-pid"
 echo capture >>"$WORK/order"
-if [[ \${TEST_RECORDER:-} == hangs ]]; then
+if [[ \${TEST_RECORDER:-} == @(hangs|stalls) ]]; then
   trap '' TERM
 else
   trap 'exit 0' TERM
@@ -110,16 +117,6 @@ fi
 while :; do
   sleep 0.1
 done
-STUB
-
-# The cleanup output has audio when the cleanup stub wrote it
-cat >"$WORK/bin/ffprobe" <<'STUB'
-#!/bin/bash
-if [[ -s ${@: -1} && $(<"${@: -1}") == @(processed|remuxed) ]]; then
-  echo 1
-else
-  echo 0
-fi
 STUB
 
 # Pins the timestamp in recording names when a test asks for it
@@ -204,8 +201,36 @@ only_recordings_left() {
   ! ls -A "$HOME/recordings" | grep -q '^\.'
 }
 
+# Audio packets in FILE so far, 0 while there are none to count
 packets() {
-  "$REAL_FFPROBE" -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1"
+  local count
+  count=$("$REAL_FFPROBE" -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null | head -n 1)
+  [[ $count =~ ^[0-9]+$ ]] || count=0
+  echo "$count"
+}
+
+decodes_fully() {
+  "$REAL_FFMPEG" -nostdin -v error -xerror -i "$1" -map 0:a:0 -f null - >/dev/null 2>&1
+}
+
+# Stands in for a recorder the stop signals; the path argument is only there so
+# the cleanup can find it
+start_fake_recorder() {
+  bash -c 'trap "exit 0" TERM; while :; do sleep 0.1; done' "$WORK/fake-recorder" >/dev/null 2>&1 &
+  echo $! >"$WORK/recorder-pid"
+}
+
+# True once a process descended from PID is blocked in flock
+waiting_at_lock() {
+  local waiter ancestor
+  for waiter in $("$REAL_PGREP" -x flock); do
+    ancestor=$waiter
+    while [[ -n $ancestor ]] && ((ancestor > 1)); do
+      ((ancestor == $1)) && return 0
+      ancestor=$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ')
+    done
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------- install
@@ -219,6 +244,12 @@ check "widget is enabled" grep -q "omarchy plugin enable gg.arkship.voice-record
 cp "$MENU" "$WORK/once.jsonc"
 bash "$PLUGIN/setup" install --yes >/dev/null
 check "install twice changes nothing" cmp -s "$WORK/once.jsonc" "$MENU"
+
+# An install from before the guards were limited to this user gets the new ones
+sed -i "s/pgrep -u \\\$UID -f/pgrep -f/" "$MENU"
+check "an older menu block is set up to replace" bash -c '! cmp -s "$0" "$1"' "$WORK/once.jsonc" "$MENU"
+bash "$PLUGIN/setup" install --yes >/dev/null
+check "reinstall replaces an older menu block" cmp -s "$WORK/once.jsonc" "$MENU"
 
 # ---------------------------------------------------------------- start
 reset_logs
@@ -317,6 +348,24 @@ stop_status=$?
 set -e
 check "a stalled start releases the lock" test "$stop_status" -eq 1
 
+# ---------------------------------------------------------------- interrupted start
+reset_logs
+TEST_RECORDER=stalls "$VR" start >/dev/null 2>&1 &
+launcher_pid=$!
+wait_for_line capture "$WORK/order" || true
+kill -TERM "$launcher_pid"
+wait "$launcher_pid" 2>/dev/null || true
+check "an interrupted start ends its recorder" recorder_gone
+check "an interrupted start leaves no state" test ! -e "$STATE"
+
+# ---------------------------------------------------------------- lock failure
+reset_logs
+rm -f "$XDG_RUNTIME_DIR/voice-recorder.lock"
+mkdir "$XDG_RUNTIME_DIR/voice-recorder.lock"
+check "voice recording refuses to run without its lock" bash -c '! timeout 30 "$0" start' "$VR"
+check "voice recording starts nothing without its lock" test ! -e "$WORK/ffmpeg-args"
+rmdir "$XDG_RUNTIME_DIR/voice-recorder.lock"
+
 # ---------------------------------------------------------------- overlap
 vr start >/dev/null 2>&1 || true
 FIRST=$(<"$STATE")
@@ -326,7 +375,17 @@ stop_pid=$!
 wait_for_line finalize-begin "$WORK/order" || true
 vr start >/dev/null 2>&1 &
 start_pid=$!
-if wait_for_line capture "$WORK/order"; then
+# Released only once the second start is provably queued behind the lock
+for _ in {1..100}; do
+  waiting_at_lock "$start_pid" && break
+  sleep 0.05
+done
+if waiting_at_lock "$start_pid"; then
+  queued=true
+else
+  queued=false
+fi
+if grep -qx capture "$WORK/order"; then
   early=true
 else
   early=false
@@ -334,6 +393,7 @@ fi
 touch "$WORK/gate"
 wait "$stop_pid" || true
 wait "$start_pid" || true
+check "a start during a save queues at the lock" test "$queued" == true
 check "a start during a save waits for it" test "$early" == false
 check "a start during a save runs after it" test "$(paste -sd' ' "$WORK/order")" == "finalize-begin finalize-end capture"
 check "the overlapped stop saves its own recording" test "$(<"$WORK/first-saved")" == "$FIRST"
@@ -347,27 +407,36 @@ check "stop with nothing recording clears a stale bar" grep -q "omarchy-shell -q
 check "every recorder lookup and signal is limited to this user's recorder" test ! -s "$WORK/stub-errors"
 
 # ---------------------------------------------------------------- real audio
-# Hard-kill a real ffmpeg writing a synthetic tone with the recorder's fragment
-# settings, then stop it through the command with the real ffmpeg cleanup.
+# The rest runs the real ffmpeg cleanup on synthetic audio written with the
+# recorder's fragment settings.
 eval "$(sed -n 's/^\(FRAGMENT_ARGS=(.*)\)$/\1/p' "$VR")"
-SYNTHETIC="$HOME/recordings/voicerecording-synthetic.m4a"
-"$REAL_FFMPEG" -nostdin -hide_banner -loglevel error -re -f lavfi -i "sine=frequency=440:sample_rate=48000" \
-  -c:a aac "${FRAGMENT_ARGS[@]}" "$SYNTHETIC" &
-synthetic_pid=$!
-sleep 3
-kill -9 "$synthetic_pid"
-wait "$synthetic_pid" 2>/dev/null || true
-check "a hard-killed recording still decodes" test "$(packets "$SYNTHETIC")" -gt 47
-
 mkdir -p "$WORK/real-bin"
 cp "$WORK/bin"/{pgrep,pkill,omarchy-shell,omarchy-notification-send} "$WORK/real-bin/"
-bash -c 'trap "exit 0" TERM; while :; do sleep 0.1; done' &
-echo $! >"$WORK/recorder-pid"
-echo "$SYNTHETIC" >"$STATE"
-reset_logs
-PATH="$WORK/real-bin:$ORIGINAL_PATH" timeout 60 "$VR" stop >/dev/null 2>&1 || true
+
+stop_with_real_ffmpeg() {
+  start_fake_recorder
+  echo "$1" >"$STATE"
+  reset_logs
+  PATH="$WORK/real-bin:$ORIGINAL_PATH" timeout 60 "$VR" stop >/dev/null 2>&1
+}
+
+# Hard-kill a real ffmpeg once two seconds of fragments are on disk
+SYNTHETIC="$HOME/recordings/voicerecording-synthetic.m4a"
+"$REAL_FFMPEG" -nostdin -hide_banner -loglevel error -re -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+  -c:a aac "${FRAGMENT_ARGS[@]}" "$SYNTHETIC" >/dev/null 2>&1 &
+synthetic_pid=$!
+for _ in {1..200}; do
+  (($(packets "$SYNTHETIC") >= 94)) && break
+  sleep 0.1
+done
+kill -9 "$synthetic_pid"
+wait "$synthetic_pid" 2>/dev/null || true
+check "a hard-killed recording decodes, all but its last second" test "$(packets "$SYNTHETIC")" -ge 94
+check "a hard-killed recording decodes cleanly" decodes_fully "$SYNTHETIC"
+
+stop_with_real_ffmpeg "$SYNTHETIC" || true
 check "a hard-killed recording is cleaned up and saved" grep -q "Voice recording saved" "$WORK/calls"
-check "the cleaned-up recording decodes" test "$(packets "$SYNTHETIC")" -gt 47
+check "the cleaned-up recording decodes" decodes_fully "$SYNTHETIC"
 check "the cleaned-up recording is a regular .m4a" bash -c '! LC_ALL=C grep -a -q moof "$0"' "$SYNTHETIC"
 
 # A second of silence is too quiet for loudnorm, so the real cleanup has to
@@ -375,14 +444,42 @@ check "the cleaned-up recording is a regular .m4a" bash -c '! LC_ALL=C grep -a -
 QUIET="$HOME/recordings/voicerecording-quiet.m4a"
 "$REAL_FFMPEG" -nostdin -hide_banner -loglevel error -f lavfi -i "anullsrc=r=48000:cl=stereo" -t 1 \
   -c:a aac "${FRAGMENT_ARGS[@]}" "$QUIET"
-bash -c 'trap "exit 0" TERM; while :; do sleep 0.1; done' &
-echo $! >"$WORK/recorder-pid"
-echo "$QUIET" >"$STATE"
-reset_logs
-PATH="$WORK/real-bin:$ORIGINAL_PATH" timeout 60 "$VR" stop >/dev/null 2>&1 || true
+stop_with_real_ffmpeg "$QUIET" || true
 check "a short silent recording is saved" grep -q "Voice recording saved" "$WORK/calls"
-check "a short silent recording decodes" test "$(packets "$QUIET")" -gt 0
+check "a short silent recording decodes" decodes_fully "$QUIET"
 check "a short silent recording is a regular .m4a" bash -c '! LC_ALL=C grep -a -q moof "$0"' "$QUIET"
+
+# Audio damaged past its first packet still has its packets, so the rewrite
+# the quiet clip fell back on would succeed. It mustn't count as saved.
+DAMAGED="$HOME/recordings/voicerecording-damaged.m4a"
+"$REAL_FFMPEG" -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 4 \
+  -c:a aac "${FRAGMENT_ARGS[@]}" "$DAMAGED"
+python3 - "$DAMAGED" <<'PY'
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+offset, first = 0, True
+while offset + 8 <= len(data):
+    size, kind = struct.unpack(">I4s", data[offset:offset + 8])
+    if size < 8:
+        break
+    if kind == b"mdat":
+        if not first:
+            data[offset + 8:offset + size] = bytes(size - 8)
+        first = False
+    offset += size
+open(path, "wb").write(data)
+PY
+cp "$DAMAGED" "$WORK/damaged-original"
+if stop_with_real_ffmpeg "$DAMAGED"; then
+  damaged_saved=true
+else
+  damaged_saved=false
+fi
+check "a damaged recording fails its stop" test "$damaged_saved" == false
+check "a damaged recording is kept exactly as recorded" cmp -s "$DAMAGED" "$WORK/damaged-original"
+check "a damaged recording leaves no intermediate file" only_recordings_left
+check "a damaged recording is reported as possibly damaged" grep -q "Voice recording may be damaged" "$WORK/calls"
 
 # ---------------------------------------------------------------- leftovers
 check "no recorder stub outlives the tests" bash -c '! "$0" -f "$1"' "$REAL_PGREP" "$WORK/bin/[f]fmpeg"
